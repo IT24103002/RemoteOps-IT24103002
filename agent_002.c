@@ -13,9 +13,10 @@
      6. PUT file upload with exact byte-count handling
      7. GET file download with exact byte-count handling
      8. UDP monitoring (MONITOR START/STOP)
+     9. Robust disconnect handling + signal handling
    ============================================================ */
 
-#define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
+#define _POSIX_C_SOURCE 200809L   /* for popen/pclose, nanosleep */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #include <stdarg.h>        /* va_list for log_message */
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -75,12 +77,20 @@ static void log_message(const char *format, ...) {
 static int send_line(int fd, const char *body) {
     char out[LINE_BUF_SIZE];
     int n = snprintf(out, sizeof(out), "%s SID:%s\n", body, SID);
-    if (n < 0 || n >= (int)sizeof(out)) return -1;
+    if (n < 0 || n >= (int)sizeof(out)) {
+        log_message("send_line: snprintf overflow for fd=%d", fd);
+        return -1;
+    }
 
     ssize_t sent = 0;
     while (sent < n) {
         ssize_t s = send(fd, out + sent, n - sent, 0);
-        if (s <= 0) return -1;
+        if (s < 0) {
+            log_message("send_line: send() failed fd=%d: %s",
+                        fd, strerror(errno));
+            return -1;
+        }
+        if (s == 0) return -1;
         sent += s;
     }
     return 0;
@@ -358,10 +368,10 @@ static void handle_get(int fd, const char *filename, const char *ip) {
    ============================================================ */
 typedef struct {
     pthread_t thread;
-    int       active;                    /* 1 = keep sending, 0 = stop */
-    int       running;                   /* 1 = thread exists */
-    char      client_ip[INET_ADDRSTRLEN];/* where to send datagrams   */
-    int       udp_port;                  /* controller's UDP port     */
+    int       active;
+    int       running;
+    char      client_ip[INET_ADDRSTRLEN];
+    int       udp_port;
 } monitor_state_t;
 
 /* ============================================================
@@ -401,10 +411,8 @@ static void *monitor_thread(void *arg) {
             log_message("UDP sendto failed: %s", strerror(errno));
         }
 
-        /* Sleep MONITOR_INTERVAL_SEC sec but in 100 ms chunks so
-           that STOP takes effect quickly. */
         int chunks = MONITOR_INTERVAL_SEC * 10;
-        struct timespec ts = {0, 100 * 1000 * 1000};
+        struct timespec ts = {0, 100 * 1000 * 1000};  /* 100 ms */
         for (int i = 0; i < chunks && m->active; i++) {
             nanosleep(&ts, NULL);
         }
@@ -426,7 +434,7 @@ typedef struct {
 } client_info_t;
 
 /* ============================================================
-   Monitoring helpers (must be above handle_client)
+   Monitoring helpers.
    ============================================================ */
 static void monitor_start(client_info_t *info, int udp_port) {
     if (udp_port <= 0 || udp_port > 65535) {
@@ -583,7 +591,7 @@ static void *handle_client(void *arg) {
                         }
                     }
                     else if (strcasecmp(cmd, "QUIT") == 0) {
-                        monitor_stop(info, 0);   /* silent */
+                        monitor_stop(info, 0);
                         send_line(fd, "OK BYE");
                         log_message("[%s] QUIT", ip);
                         goto cleanup;
@@ -607,8 +615,14 @@ static void *handle_client(void *arg) {
         }
     }
 
+    if (n < 0) {
+        log_message("[%s] recv error: %s", ip, strerror(errno));
+    } else if (n == 0) {
+        log_message("[%s] Client closed connection cleanly", ip);
+    }
+
 cleanup:
-    monitor_stop(info, 0);   /* safe - no-op if not running */
+    monitor_stop(info, 0);
 
     log_message("Client disconnected: %s (fd=%d)", ip, fd);
     printf("Client disconnected: %s (fd=%d)\n", ip, fd);
@@ -620,9 +634,29 @@ cleanup:
 }
 
 /* ============================================================
+   Signal handling.
+   ============================================================ */
+static void handle_signal(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        log_message("Agent shutting down (signal %d)", sig);
+        printf("\nAgent shutting down.\n");
+        fflush(stdout);
+        _exit(EXIT_SUCCESS);
+    }
+}
+
+static void install_signal_handlers(void) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT,  handle_signal);
+    signal(SIGTERM, handle_signal);
+}
+
+/* ============================================================
    main(): socket setup, bind, listen, accept loop.
    ============================================================ */
 int main(void) {
+    install_signal_handlers();
+
     int server_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -661,7 +695,13 @@ int main(void) {
     printf("Press Ctrl+C to stop.\n");
     fflush(stdout);
 
-    log_message("Agent started on port %d", PORT);
+    log_message("============================================");
+    log_message("RemoteOps Agent starting - IT24103002");
+    log_message("Port: %d | SID: %s | Token: %s",
+                PORT, SID, AUTH_TOKEN);
+    log_message("Storage: %s | Max file: %d bytes",
+                STORAGE_PATH, MAX_FILE_SIZE);
+    log_message("============================================");
 
     while (1) {
         struct sockaddr_in client_addr;
@@ -671,6 +711,7 @@ int main(void) {
                                (struct sockaddr *)&client_addr,
                                &addr_len);
         if (client_fd < 0) {
+            if (errno == EINTR) continue;   /* interrupted by signal */
             perror("accept");
             continue;
         }
@@ -681,7 +722,7 @@ int main(void) {
             continue;
         }
 
-        memset(info, 0, sizeof(*info));   /* zero monitor state too */
+        memset(info, 0, sizeof(*info));
         info->client_fd = client_fd;
         info->authed    = 0;
 

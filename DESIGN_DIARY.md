@@ -149,3 +149,24 @@
 - Next: thread-safe logging polish, graceful disconnect handling.
 
 
+## 2026-10-06 - Session 9: Robustness & graceful shutdown
+- Added signal handling:
+  - SIGPIPE ignored (SIG_IGN) so broken-pipe send() returns -1
+    instead of killing the process. This is the classic network
+    server bug: without it, a client disconnecting mid-response
+    crashes the agent.
+  - SIGINT / SIGTERM -> log shutdown, _exit(0).
+- Added startup banner to the log with personalised values
+  (port, SID, token, storage path, max file size).
+- Improved send_line() to log errno on failure.
+- Improved handle_client() to log why the read loop exited
+  (clean close vs recv error).
+- Tested:
+  - Clean disconnect via QUIT -> logged.
+  - Clean disconnect via stdin EOF -> logged as "closed cleanly".
+  - `pkill -9 nc` -> logged as recv error, agent survived.
+  - Mid-transfer disconnect (GET aborted) -> SIGPIPE absorbed,
+    agent survived, logged "GET aborted at N/M bytes".
+  - Ctrl+C on agent -> logged "shutting down", clean exit.
+- Next: build the real controller.
+
