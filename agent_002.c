@@ -9,7 +9,8 @@
      2. Accept loop with thread-per-client concurrency
      3. AUTH command + line-based protocol framing
      4. SYSINFO + LISTPROC handlers
-     5. EXEC with strict whitelist (DATE, UPTIME, DISKFREE, HOSTNAME, WHOAMI)
+     5. EXEC with strict whitelist
+     6. PUT file upload with exact byte-count handling
    ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
@@ -33,6 +34,8 @@
 #define LOG_FILE      "remoteops_IT24103002.log"
 #define MAX_CLIENTS   5
 #define LINE_BUF_SIZE 4096
+#define STORAGE_PATH  "./agentfiles/IT24103002/"
+#define MAX_FILE_SIZE (10 * 1024 * 1024)   /* 10 MB cap */
 
 /* ============================================================
    Thread-safe logging
@@ -80,22 +83,19 @@ static int send_line(int fd, const char *body) {
 }
 
 /* ============================================================
-   SYSINFO: read CPU load, memory used, uptime from /proc.
-   Response: OK SYSINFO <cpu_load> <mem_used_mb> <uptime_sec>
+   SYSINFO: CPU load, memory used, uptime from /proc.
    ============================================================ */
 static void handle_sysinfo(int fd) {
     double cpu_load    = 0.0;
     long   mem_used_mb = 0;
     double uptime_sec  = 0.0;
 
-    /* 1-minute CPU load average from /proc/loadavg */
     FILE *fp = fopen("/proc/loadavg", "r");
     if (fp) {
         fscanf(fp, "%lf", &cpu_load);
         fclose(fp);
     }
 
-    /* Memory used = (MemTotal - MemAvailable) / 1024 */
     long mem_total_kb = 0, mem_avail_kb = 0;
     fp = fopen("/proc/meminfo", "r");
     if (fp) {
@@ -112,7 +112,6 @@ static void handle_sysinfo(int fd) {
     if (mem_total_kb > mem_avail_kb)
         mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024;
 
-    /* Uptime in seconds from /proc/uptime */
     fp = fopen("/proc/uptime", "r");
     if (fp) {
         fscanf(fp, "%lf", &uptime_sec);
@@ -127,8 +126,7 @@ static void handle_sysinfo(int fd) {
 }
 
 /* ============================================================
-   LISTPROC: snapshot of running processes.
-   Response: OK PROCS <comma-separated "pid-name" entries>
+   LISTPROC: process snapshot.
    ============================================================ */
 static void handle_listproc(int fd) {
     FILE *fp = popen("ps -eo pid,comm --no-headers | head -20", "r");
@@ -148,7 +146,6 @@ static void handle_listproc(int fd) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') continue;
 
-        /* Replace the space between PID and name with '-' */
         for (char *q = p; *q; q++) {
             if (*q == ' ') { *q = '-'; break; }
         }
@@ -169,10 +166,7 @@ static void handle_listproc(int fd) {
 }
 
 /* ============================================================
-   EXEC <name>: strictly-whitelisted remote commands.
-   Whitelist (fixed by §2.3, MUST NOT be extended):
-       DATE, UPTIME, DISKFREE, HOSTNAME, WHOAMI
-   Anything else -> ERR 002 COMMAND_NOT_ALLOWED.
+   EXEC <name>: strict whitelist of exactly five commands.
    ============================================================ */
 static void handle_exec(int fd, const char *name) {
     if (!name || *name == '\0') {
@@ -180,7 +174,6 @@ static void handle_exec(int fd, const char *name) {
         return;
     }
 
-    /* Map each allowed name -> the exact shell command to run */
     const char *shell_cmd = NULL;
 
     if      (strcasecmp(name, "DATE")     == 0) shell_cmd = "date";
@@ -194,7 +187,6 @@ static void handle_exec(int fd, const char *name) {
         return;
     }
 
-    /* Run the command, capture stdout */
     FILE *fp = popen(shell_cmd, "r");
     if (!fp) {
         send_line(fd, "ERR 003 INTERNAL_ERROR");
@@ -225,17 +217,82 @@ static void handle_exec(int fd, const char *name) {
 }
 
 /* ============================================================
+   PUT: receive <filesize> raw bytes and store under STORAGE_PATH.
+   Called from the dispatcher after seeing the header line.
+   ============================================================ */
+static void handle_put(int fd, const char *filename,
+                       long filesize, const char *ip) {
+    /* Filename safety */
+    if (!filename || *filename == '\0' ||
+        strchr(filename, '/') || strstr(filename, "..")) {
+        send_line(fd, "ERR 006 INVALID_FILENAME");
+        log_message("[%s] PUT rejected (bad filename): %s",
+                    ip, filename ? filename : "(null)");
+        return;
+    }
+
+    if (filesize <= 0 || filesize > MAX_FILE_SIZE) {
+        send_line(fd, "ERR 004 FILE_TOO_LARGE");
+        log_message("[%s] PUT rejected (size %ld)", ip, filesize);
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s%s", STORAGE_PATH, filename);
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        send_line(fd, "ERR 003 INTERNAL_ERROR");
+        log_message("[%s] PUT fopen failed: %s", ip, path);
+        return;
+    }
+
+    char buf[4096];
+    long received = 0;
+
+    while (received < filesize) {
+        long remaining = filesize - received;
+        size_t want = (remaining < (long)sizeof(buf))
+                      ? (size_t)remaining
+                      : sizeof(buf);
+
+        ssize_t r = recv(fd, buf, want, 0);
+        if (r <= 0) {
+            fclose(fp);
+            remove(path);
+            log_message("[%s] PUT failed: conn lost at %ld/%ld bytes",
+                        ip, received, filesize);
+            return;
+        }
+        if (fwrite(buf, 1, r, fp) != (size_t)r) {
+            fclose(fp);
+            remove(path);
+            send_line(fd, "ERR 003 INTERNAL_ERROR");
+            log_message("[%s] PUT fwrite failed", ip);
+            return;
+        }
+        received += r;
+    }
+
+    fclose(fp);
+
+    char body[512];
+    snprintf(body, sizeof(body), "OK FILE_RECEIVED %s", filename);
+    send_line(fd, body);
+    log_message("[%s] PUT OK: %s (%ld bytes)", ip, filename, filesize);
+}
+
+/* ============================================================
    Per-client state passed to each thread.
    ============================================================ */
 typedef struct {
     int  client_fd;
     char client_ip[INET_ADDRSTRLEN];
-    int  authed;                  /* 0 = not authenticated, 1 = authenticated */
+    int  authed;
 } client_info_t;
 
 /* ============================================================
    Thread function: handles one client for its lifetime.
-   Reads bytes, splits into lines on '\n', dispatches commands.
    ============================================================ */
 static void *handle_client(void *arg) {
     client_info_t *info = (client_info_t *)arg;
@@ -261,7 +318,6 @@ static void *handle_client(void *arg) {
 
             if (c == '\n') {
                 line[line_len] = '\0';
-
                 if (line_len > 0 && line[line_len - 1] == '\r') {
                     line[--line_len] = '\0';
                 }
@@ -270,7 +326,10 @@ static void *handle_client(void *arg) {
 
                 char cmd[64]   = {0};
                 char arg1[256] = {0};
-                int  matched   = sscanf(line, "%63s %255s", cmd, arg1);
+                char arg2[64]  = {0};
+                int  matched   = sscanf(line,
+                                        "%63s %255s %63s",
+                                        cmd, arg1, arg2);
 
                 if (matched >= 1) {
                     if (strcasecmp(cmd, "AUTH") == 0) {
@@ -287,7 +346,7 @@ static void *handle_client(void *arg) {
                     }
                     else if (!info->authed) {
                         send_line(fd, "ERR 001 AUTH_REQUIRED");
-                        log_message("[%s] Rejected (not authenticated): %s",
+                        log_message("[%s] Rejected (not authed): %s",
                                     ip, cmd);
                     }
                     else if (strcasecmp(cmd, "SYSINFO") == 0) {
@@ -303,6 +362,20 @@ static void *handle_client(void *arg) {
                         log_message("[%s] EXEC %s", ip,
                                     arg1[0] ? arg1 : "(empty)");
                     }
+                    else if (strcasecmp(cmd, "PUT") == 0) {
+                        if (matched < 3) {
+                            send_line(fd, "ERR 006 INVALID_FILENAME");
+                            log_message("[%s] PUT missing args", ip);
+                        } else {
+                            long filesize = atol(arg2);
+                            handle_put(fd, arg1, filesize, ip);
+                        }
+                        /* PUT consumed raw bytes directly from the
+                           socket; skip the rest of this recv buffer. */
+                        line_len = 0;
+                        i = n;
+                        continue;
+                    }
                     else if (strcasecmp(cmd, "QUIT") == 0) {
                         send_line(fd, "OK BYE");
                         log_message("[%s] QUIT", ip);
@@ -310,8 +383,7 @@ static void *handle_client(void *arg) {
                     }
                     else {
                         send_line(fd, "ERR 999 NOT_IMPLEMENTED");
-                        log_message("[%s] Unimplemented command: %s",
-                                    ip, cmd);
+                        log_message("[%s] Unimplemented: %s", ip, cmd);
                     }
                 }
 
@@ -339,7 +411,7 @@ cleanup:
 }
 
 /* ============================================================
-   main(): create socket, bind, listen, accept loop.
+   main(): socket setup, bind, listen, accept loop.
    ============================================================ */
 int main(void) {
     int server_fd;
