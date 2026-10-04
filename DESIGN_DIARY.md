@@ -18,3 +18,27 @@
 - Log file now contains connect/receive/disconnect entries with
   timestamps - verified with `cat remoteops_IT24103002.log`.
 - Next: implement AUTH command and the line-based protocol framing.
+
+
+
+## 2026-10-05 - Session 3: AUTH + line-based framing
+- Implemented **line-based framing**: accumulate bytes in `line[]`,
+  split on `\n`. Handles partial recv() and multiple lines in one recv().
+- Added `send_line()` helper that appends ` SID:2003\n` automatically -
+  so every response has the personalised tag.
+- Added `authed` flag to `client_info_t` per client.
+- Implemented AUTH command: compares against token `OPS-3002`.
+  - Correct token: `OK AUTHENTICATED SID:2003`, authed=1.
+  - Wrong token: `ERR 001 AUTH_FAILED SID:2003`, authed=0.
+- Gate: any non-AUTH command before auth returns
+  `ERR 001 AUTH_REQUIRED SID:2003` - as per §2.3.
+- Implemented QUIT command: `OK BYE SID:2003` and clean disconnect.
+- Any other command returns `ERR 999 NOT_IMPLEMENTED SID:2003`
+  (temporary - real handlers in later sessions).
+- Tested:
+  - AUTH happy path -> OK AUTHENTICATED.
+  - AUTH wrong token -> ERR 001.
+  - SYSINFO before auth -> ERR 001 AUTH_REQUIRED.
+  - Multiple lines pasted at once -> all processed correctly.
+  - Partial line without \n -> agent buffers until newline arrives.
+- Next: implement SYSINFO and LISTPROC.
