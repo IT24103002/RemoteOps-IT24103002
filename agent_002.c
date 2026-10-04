@@ -9,6 +9,7 @@
      2. Accept loop with thread-per-client concurrency
      3. AUTH command + line-based protocol framing
      4. SYSINFO + LISTPROC handlers
+     5. EXEC with strict whitelist (DATE, UPTIME, DISKFREE, HOSTNAME, WHOAMI)
    ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
@@ -79,7 +80,7 @@ static int send_line(int fd, const char *body) {
 }
 
 /* ============================================================
-   SYSINFO: read CPU load, memory used, and uptime from /proc.
+   SYSINFO: read CPU load, memory used, uptime from /proc.
    Response: OK SYSINFO <cpu_load> <mem_used_mb> <uptime_sec>
    ============================================================ */
 static void handle_sysinfo(int fd) {
@@ -141,10 +142,8 @@ static void handle_listproc(int fd) {
     int  first = 1;
 
     while (fgets(line, sizeof(line), fp)) {
-        /* Strip newline */
         line[strcspn(line, "\n")] = '\0';
 
-        /* Trim leading spaces/tabs */
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') continue;
@@ -170,6 +169,62 @@ static void handle_listproc(int fd) {
 }
 
 /* ============================================================
+   EXEC <name>: strictly-whitelisted remote commands.
+   Whitelist (fixed by §2.3, MUST NOT be extended):
+       DATE, UPTIME, DISKFREE, HOSTNAME, WHOAMI
+   Anything else -> ERR 002 COMMAND_NOT_ALLOWED.
+   ============================================================ */
+static void handle_exec(int fd, const char *name) {
+    if (!name || *name == '\0') {
+        send_line(fd, "ERR 002 COMMAND_NOT_ALLOWED");
+        return;
+    }
+
+    /* Map each allowed name -> the exact shell command to run */
+    const char *shell_cmd = NULL;
+
+    if      (strcasecmp(name, "DATE")     == 0) shell_cmd = "date";
+    else if (strcasecmp(name, "UPTIME")   == 0) shell_cmd = "uptime";
+    else if (strcasecmp(name, "DISKFREE") == 0) shell_cmd = "df -h";
+    else if (strcasecmp(name, "HOSTNAME") == 0) shell_cmd = "hostname";
+    else if (strcasecmp(name, "WHOAMI")   == 0) shell_cmd = "whoami";
+
+    if (!shell_cmd) {
+        send_line(fd, "ERR 002 COMMAND_NOT_ALLOWED");
+        return;
+    }
+
+    /* Run the command, capture stdout */
+    FILE *fp = popen(shell_cmd, "r");
+    if (!fp) {
+        send_line(fd, "ERR 003 INTERNAL_ERROR");
+        return;
+    }
+
+    char output[2048] = {0};
+    char line[256];
+    int  first = 1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '\0') continue;
+
+        if (!first) {
+            strncat(output, " ",
+                    sizeof(output) - strlen(output) - 1);
+        }
+        strncat(output, line,
+                sizeof(output) - strlen(output) - 1);
+        first = 0;
+    }
+    pclose(fp);
+
+    char body[2200];
+    snprintf(body, sizeof(body), "OK EXEC_RESULT %s", output);
+    send_line(fd, body);
+}
+
+/* ============================================================
    Per-client state passed to each thread.
    ============================================================ */
 typedef struct {
@@ -186,7 +241,6 @@ static void *handle_client(void *arg) {
     client_info_t *info = (client_info_t *)arg;
     int  fd = info->client_fd;
 
-    /* Local copy of the IP so we can free(info) at cleanup */
     char ip[INET_ADDRSTRLEN];
     strncpy(ip, info->client_ip, INET_ADDRSTRLEN - 1);
     ip[INET_ADDRSTRLEN - 1] = '\0';
@@ -195,11 +249,9 @@ static void *handle_client(void *arg) {
     printf("Client connected: %s (fd=%d)\n", ip, fd);
     fflush(stdout);
 
-    /* Line accumulator: bytes from recv() are appended here until '\n' */
     char line[LINE_BUF_SIZE];
     int  line_len = 0;
 
-    /* recv buffer: a single recv may return 0.5 lines, 1 line, or many */
     char in[LINE_BUF_SIZE];
     ssize_t n;
 
@@ -208,17 +260,14 @@ static void *handle_client(void *arg) {
             char c = in[i];
 
             if (c == '\n') {
-                /* Complete line in `line` */
                 line[line_len] = '\0';
 
-                /* Strip trailing \r if client sent CRLF */
                 if (line_len > 0 && line[line_len - 1] == '\r') {
                     line[--line_len] = '\0';
                 }
 
                 log_message("[%s] <- %s", ip, line);
 
-                /* ---- Parse: command word + first argument ---- */
                 char cmd[64]   = {0};
                 char arg1[256] = {0};
                 int  matched   = sscanf(line, "%63s %255s", cmd, arg1);
@@ -237,7 +286,6 @@ static void *handle_client(void *arg) {
                         }
                     }
                     else if (!info->authed) {
-                        /* Any non-AUTH command before AUTH is rejected */
                         send_line(fd, "ERR 001 AUTH_REQUIRED");
                         log_message("[%s] Rejected (not authenticated): %s",
                                     ip, cmd);
@@ -250,24 +298,26 @@ static void *handle_client(void *arg) {
                         handle_listproc(fd);
                         log_message("[%s] LISTPROC sent", ip);
                     }
+                    else if (strcasecmp(cmd, "EXEC") == 0) {
+                        handle_exec(fd, arg1);
+                        log_message("[%s] EXEC %s", ip,
+                                    arg1[0] ? arg1 : "(empty)");
+                    }
                     else if (strcasecmp(cmd, "QUIT") == 0) {
                         send_line(fd, "OK BYE");
                         log_message("[%s] QUIT", ip);
                         goto cleanup;
                     }
                     else {
-                        /* Real handlers for other commands come later */
                         send_line(fd, "ERR 999 NOT_IMPLEMENTED");
                         log_message("[%s] Unimplemented command: %s",
                                     ip, cmd);
                     }
                 }
 
-                /* Reset the line buffer for the next line */
                 line_len = 0;
             }
             else {
-                /* Not a newline - append to accumulator */
                 if (line_len < LINE_BUF_SIZE - 1) {
                     line[line_len++] = c;
                 } else {
@@ -296,14 +346,12 @@ int main(void) {
     struct sockaddr_in address;
     int opt = 1;
 
-    /* 1. Create TCP socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
         exit(EXIT_FAILURE);
     }
 
-    /* 2. Allow immediate port reuse after restart */
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
                    &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
@@ -311,7 +359,6 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* 3. Bind to port 9410 on all interfaces */
     address.sin_family      = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port        = htons(PORT);
@@ -323,7 +370,6 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* 4. Listen (backlog 5) */
     if (listen(server_fd, MAX_CLIENTS) < 0) {
         perror("listen");
         close(server_fd);
@@ -336,7 +382,6 @@ int main(void) {
 
     log_message("Agent started on port %d", PORT);
 
-    /* 5. Accept loop - one thread per client */
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -346,7 +391,7 @@ int main(void) {
                                &addr_len);
         if (client_fd < 0) {
             perror("accept");
-            continue;                    /* keep serving others */
+            continue;
         }
 
         client_info_t *info = malloc(sizeof(client_info_t));

@@ -58,3 +58,26 @@
   - SYSINFO before AUTH rejected with ERR 001 AUTH_REQUIRED.
   - Multiple simultaneous clients served without blocking.
 - Next: implement EXEC with strict whitelist.
+
+
+## 2026-10-05 - Session 5: EXEC with strict whitelist
+- Implemented `handle_exec()` with a **fixed whitelist** of five
+  commands exactly as specified in §2.3:
+    DATE -> date
+    UPTIME -> uptime
+    DISKFREE -> df -h
+    HOSTNAME -> hostname
+    WHOAMI -> whoami
+- Safety decisions:
+  - Only hardcoded literal strings are passed to popen(); the
+    user-supplied name is NEVER concatenated into the shell command.
+  - Any name not on the whitelist returns ERR 002 COMMAND_NOT_ALLOWED.
+  - Empty argument is rejected.
+  - Injection attempts like "DATE; rm -rf /" fail because the whole
+    string does not match any whitelist entry.
+- Wired EXEC into the dispatcher (auth-gated).
+- Tested:
+  - All five allowed commands return OK EXEC_RESULT with the SID tag.
+  - Rejected: rm -rf /, cat /etc/passwd, ls, empty, DATE; whoami.
+  - EXEC before AUTH -> ERR 001 AUTH_REQUIRED.
+- Next: implement PUT file upload with exact byte-count handling.
