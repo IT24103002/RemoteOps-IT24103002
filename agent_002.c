@@ -4,17 +4,20 @@
    Port: 9410 | SID: 2003 | Token: OPS-3002
    Log:  remoteops_IT24103002.log
    Storage: ./agentfiles/IT24103002/
-   Sessions implemented so far:
+   Sessions implemented:
      1. TCP socket setup + bind + listen
      2. Accept loop with thread-per-client concurrency
      3. AUTH command + line-based protocol framing
+     4. SYSINFO + LISTPROC handlers
    ============================================================ */
+
+#define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>      /* strcasecmp */
-#include <stdarg.h>       /* va_list for log_message */
+#include <strings.h>       /* strcasecmp */
+#include <stdarg.h>        /* va_list for log_message */
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -76,6 +79,97 @@ static int send_line(int fd, const char *body) {
 }
 
 /* ============================================================
+   SYSINFO: read CPU load, memory used, and uptime from /proc.
+   Response: OK SYSINFO <cpu_load> <mem_used_mb> <uptime_sec>
+   ============================================================ */
+static void handle_sysinfo(int fd) {
+    double cpu_load    = 0.0;
+    long   mem_used_mb = 0;
+    double uptime_sec  = 0.0;
+
+    /* 1-minute CPU load average from /proc/loadavg */
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (fp) {
+        fscanf(fp, "%lf", &cpu_load);
+        fclose(fp);
+    }
+
+    /* Memory used = (MemTotal - MemAvailable) / 1024 */
+    long mem_total_kb = 0, mem_avail_kb = 0;
+    fp = fopen("/proc/meminfo", "r");
+    if (fp) {
+        char key[64];
+        long value;
+        char unit[16];
+        while (fscanf(fp, "%63s %ld %15s", key, &value, unit) == 3) {
+            if (strcmp(key, "MemTotal:") == 0)      mem_total_kb = value;
+            if (strcmp(key, "MemAvailable:") == 0)  mem_avail_kb = value;
+            if (mem_total_kb && mem_avail_kb) break;
+        }
+        fclose(fp);
+    }
+    if (mem_total_kb > mem_avail_kb)
+        mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024;
+
+    /* Uptime in seconds from /proc/uptime */
+    fp = fopen("/proc/uptime", "r");
+    if (fp) {
+        fscanf(fp, "%lf", &uptime_sec);
+        fclose(fp);
+    }
+
+    char body[256];
+    snprintf(body, sizeof(body),
+             "OK SYSINFO %.2f %ld %.0f",
+             cpu_load, mem_used_mb, uptime_sec);
+    send_line(fd, body);
+}
+
+/* ============================================================
+   LISTPROC: snapshot of running processes.
+   Response: OK PROCS <comma-separated "pid-name" entries>
+   ============================================================ */
+static void handle_listproc(int fd) {
+    FILE *fp = popen("ps -eo pid,comm --no-headers | head -20", "r");
+    if (!fp) {
+        send_line(fd, "ERR 003 INTERNAL_ERROR");
+        return;
+    }
+
+    char procs[8192] = {0};
+    char line[128];
+    int  first = 1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* Strip newline */
+        line[strcspn(line, "\n")] = '\0';
+
+        /* Trim leading spaces/tabs */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') continue;
+
+        /* Replace the space between PID and name with '-' */
+        for (char *q = p; *q; q++) {
+            if (*q == ' ') { *q = '-'; break; }
+        }
+
+        if (!first) {
+            strncat(procs, ",",
+                    sizeof(procs) - strlen(procs) - 1);
+        }
+        strncat(procs, p,
+                sizeof(procs) - strlen(procs) - 1);
+        first = 0;
+    }
+    pclose(fp);
+
+    char body[8400];
+    snprintf(body, sizeof(body), "OK PROCS %s", procs);
+    send_line(fd, body);
+}
+
+/* ============================================================
    Per-client state passed to each thread.
    ============================================================ */
 typedef struct {
@@ -85,7 +179,7 @@ typedef struct {
 } client_info_t;
 
 /* ============================================================
-   Thread function: handles one client for its whole lifetime.
+   Thread function: handles one client for its lifetime.
    Reads bytes, splits into lines on '\n', dispatches commands.
    ============================================================ */
 static void *handle_client(void *arg) {
@@ -114,7 +208,7 @@ static void *handle_client(void *arg) {
             char c = in[i];
 
             if (c == '\n') {
-                /* We have a complete line in `line` */
+                /* Complete line in `line` */
                 line[line_len] = '\0';
 
                 /* Strip trailing \r if client sent CRLF */
@@ -148,13 +242,21 @@ static void *handle_client(void *arg) {
                         log_message("[%s] Rejected (not authenticated): %s",
                                     ip, cmd);
                     }
+                    else if (strcasecmp(cmd, "SYSINFO") == 0) {
+                        handle_sysinfo(fd);
+                        log_message("[%s] SYSINFO sent", ip);
+                    }
+                    else if (strcasecmp(cmd, "LISTPROC") == 0) {
+                        handle_listproc(fd);
+                        log_message("[%s] LISTPROC sent", ip);
+                    }
                     else if (strcasecmp(cmd, "QUIT") == 0) {
                         send_line(fd, "OK BYE");
                         log_message("[%s] QUIT", ip);
                         goto cleanup;
                     }
                     else {
-                        /* Real handlers come in Session 4+ */
+                        /* Real handlers for other commands come later */
                         send_line(fd, "ERR 999 NOT_IMPLEMENTED");
                         log_message("[%s] Unimplemented command: %s",
                                     ip, cmd);
@@ -169,7 +271,6 @@ static void *handle_client(void *arg) {
                 if (line_len < LINE_BUF_SIZE - 1) {
                     line[line_len++] = c;
                 } else {
-                    /* Line too long: drop and reset to prevent overflow */
                     log_message("[%s] Line too long, dropping", ip);
                     line_len = 0;
                 }
@@ -248,7 +349,6 @@ int main(void) {
             continue;                    /* keep serving others */
         }
 
-        /* Allocate a small struct to hand to the thread */
         client_info_t *info = malloc(sizeof(client_info_t));
         if (!info) {
             close(client_fd);
@@ -273,7 +373,7 @@ int main(void) {
             continue;
         }
 
-        pthread_detach(tid);   /* no join needed - thread cleans itself up */
+        pthread_detach(tid);
     }
 
     close(server_fd);

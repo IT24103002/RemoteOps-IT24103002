@@ -42,3 +42,19 @@
   - Multiple lines pasted at once -> all processed correctly.
   - Partial line without \n -> agent buffers until newline arrives.
 - Next: implement SYSINFO and LISTPROC.
+
+
+## 2026-10-05 - Session 4: SYSINFO + LISTPROC
+- Implemented `handle_sysinfo()` reading from /proc:
+  - /proc/loadavg for 1-minute CPU load average.
+  - /proc/meminfo for MemTotal and MemAvailable (used = total - available).
+  - /proc/uptime for uptime in seconds.
+- Implemented `handle_listproc()` using `popen("ps -eo pid,comm ...")`,
+  limited to 20 processes, comma-separated output.
+- Wired both commands into the dispatcher, gated behind AUTH.
+- Tested:
+  - AUTH then SYSINFO returns real values with SID:2003.
+  - AUTH then LISTPROC returns real process list with SID:2003.
+  - SYSINFO before AUTH rejected with ERR 001 AUTH_REQUIRED.
+  - Multiple simultaneous clients served without blocking.
+- Next: implement EXEC with strict whitelist.
