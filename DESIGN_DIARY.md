@@ -1,20 +1,20 @@
-# RemoteOps Design Diary - IT24103002
-
-## 2026-10-04 - Project setup
-- Created GitHub repository: https://github.com/IT24103002/RemoteOps-IT24103002
-- Created local folder ~/RemoteOps_IT24103002 and ran `git init`.
-- Connected to remote with `git remote add origin ...`.
-- Calculated personalised values:
-  - Port: 7000 + 2410 = **9410**
-  - SID: 3002 reversed = **2003**
-  - Auth token: **OPS-3002**
-  - Source files: `agent_002.c`, `controller_002.c`, `Makefile_002`
-  - Log: `remoteops_IT24103002.log`
-  - Storage: `./agentfiles/IT24103002/`
-- Created `.gitignore`, `README.md`, `Makefile_002`.
-
-## 2026-10-04 - Socket setup (Session 1)
-- Wrote full socket setup in `agent_002.c`:
-  socket() -> setsockopt(SO_REUSEADDR) -> bind() -> listen().
-- Added a placeholder `controller_002.c` stub so the Makefile builds both.
-- Next: implement the accept() loop with thread-per-client concurrency.
+## 2026-10-04 - Session 2: Accept loop + threads
+- Added `accept()` loop in `main()` to handle incoming connections.
+- Chose **thread-per-client** concurrency with pthreads.
+  - Justification: state per client is isolated, easy to reason about,
+    and the brief only requires 5 simultaneous clients.
+  - Alternative: select()/poll() — rejected as more complex for a
+    beginner without benefit at this scale.
+- Added thread-safe `log_message()` using pthread_mutex to prevent
+  log corruption when multiple clients write at once.
+- Added `handle_client()` thread function - for now it just echoes
+  received data back; real protocol handlers in the next session.
+- Added detached threads (`pthread_detach`) so no joins are needed.
+- Tested:
+  - Single client connects, echoes, disconnects cleanly.
+  - Three clients connected simultaneously - all served at once.
+  - `pkill -9 nc` on a client - agent did NOT crash; it logged the
+    disconnect and continued listening on port 9410.
+- Log file now contains connect/receive/disconnect entries with
+  timestamps - verified with `cat remoteops_IT24103002.log`.
+- Next: implement AUTH command and the line-based protocol framing.
