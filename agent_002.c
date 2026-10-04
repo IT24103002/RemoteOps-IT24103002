@@ -11,6 +11,7 @@
      4. SYSINFO + LISTPROC handlers
      5. EXEC with strict whitelist
      6. PUT file upload with exact byte-count handling
+     7. GET file download with exact byte-count handling
    ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
@@ -218,11 +219,9 @@ static void handle_exec(int fd, const char *name) {
 
 /* ============================================================
    PUT: receive <filesize> raw bytes and store under STORAGE_PATH.
-   Called from the dispatcher after seeing the header line.
    ============================================================ */
 static void handle_put(int fd, const char *filename,
                        long filesize, const char *ip) {
-    /* Filename safety */
     if (!filename || *filename == '\0' ||
         strchr(filename, '/') || strstr(filename, "..")) {
         send_line(fd, "ERR 006 INVALID_FILENAME");
@@ -280,6 +279,77 @@ static void handle_put(int fd, const char *filename,
     snprintf(body, sizeof(body), "OK FILE_RECEIVED %s", filename);
     send_line(fd, body);
     log_message("[%s] PUT OK: %s (%ld bytes)", ip, filename, filesize);
+}
+
+/* ============================================================
+   GET <filename>: send a file previously stored via PUT.
+   Response: "OK FILE_SEND <name> <size> SID:2003\n"
+             followed by exactly <size> raw bytes.
+   ============================================================ */
+static void handle_get(int fd, const char *filename, const char *ip) {
+    if (!filename || *filename == '\0' ||
+        strchr(filename, '/') || strstr(filename, "..")) {
+        send_line(fd, "ERR 006 INVALID_FILENAME");
+        log_message("[%s] GET rejected (bad filename): %s",
+                    ip, filename ? filename : "(null)");
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s%s", STORAGE_PATH, filename);
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        send_line(fd, "ERR 005 FILE_NOT_FOUND");
+        log_message("[%s] GET not found: %s", ip, filename);
+        return;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        send_line(fd, "ERR 003 INTERNAL_ERROR");
+        return;
+    }
+    long filesize = ftell(fp);
+    if (filesize < 0) {
+        fclose(fp);
+        send_line(fd, "ERR 003 INTERNAL_ERROR");
+        return;
+    }
+    rewind(fp);
+
+    /* Send the header line */
+    char header[512];
+    snprintf(header, sizeof(header),
+             "OK FILE_SEND %s %ld", filename, filesize);
+    if (send_line(fd, header) != 0) {
+        fclose(fp);
+        log_message("[%s] GET header send failed", ip);
+        return;
+    }
+
+    /* Send exactly filesize raw bytes - NO trailing newline */
+    char buf[4096];
+    long sent_total = 0;
+    size_t n;
+
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        size_t offset = 0;
+        while (offset < n) {
+            ssize_t s = send(fd, buf + offset, n - offset, 0);
+            if (s <= 0) {
+                fclose(fp);
+                log_message("[%s] GET aborted at %ld/%ld bytes",
+                            ip, sent_total, filesize);
+                return;
+            }
+            offset += s;
+            sent_total += s;
+        }
+    }
+    fclose(fp);
+
+    log_message("[%s] GET OK: %s (%ld bytes)", ip, filename, filesize);
 }
 
 /* ============================================================
@@ -361,6 +431,14 @@ static void *handle_client(void *arg) {
                         handle_exec(fd, arg1);
                         log_message("[%s] EXEC %s", ip,
                                     arg1[0] ? arg1 : "(empty)");
+                    }
+                    else if (strcasecmp(cmd, "GET") == 0) {
+                        if (matched < 2) {
+                            send_line(fd, "ERR 006 INVALID_FILENAME");
+                            log_message("[%s] GET missing filename", ip);
+                        } else {
+                            handle_get(fd, arg1, ip);
+                        }
                     }
                     else if (strcasecmp(cmd, "PUT") == 0) {
                         if (matched < 3) {

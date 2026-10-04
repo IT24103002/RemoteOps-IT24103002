@@ -107,4 +107,21 @@
   possible improvement if time allows.
 - Next: GET file download.
 
+## 2026-10-06 - Session 7: GET file download
+- Implemented `handle_get()`:
+  - Filename safety check (no "/", no "..").
+  - Opens file in binary mode, gets size via fseek/ftell.
+  - Sends header line "OK FILE_SEND <name> <size> SID:2003\n".
+  - Sends exactly <size> raw bytes via a send() loop.
+  - Missing file -> ERR 005 FILE_NOT_FOUND.
+  - Bad filename -> ERR 006 INVALID_FILENAME.
+- Wired GET into the dispatcher (auth-gated).
+- Note: the body bytes are sent with send(), NOT send_line() - no
+  trailing newline is added after the body.
+- Tested with Python client:
+  - AUTH then GET hello.txt -> header + 12 bytes.
+  - cmp /tmp/downloaded.txt /tmp/hello.txt -> BYTE-IDENTICAL.
+  - Missing file, path traversal, missing arg -> correct ERR codes.
+- Next: UDP monitoring with MONITOR START/STOP.
+
 
