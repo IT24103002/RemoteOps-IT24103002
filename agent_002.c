@@ -12,6 +12,7 @@
      5. EXEC with strict whitelist
      6. PUT file upload with exact byte-count handling
      7. GET file download with exact byte-count handling
+     8. UDP monitoring (MONITOR START/STOP)
    ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L   /* for popen/pclose */
@@ -22,6 +23,7 @@
 #include <strings.h>       /* strcasecmp */
 #include <stdarg.h>        /* va_list for log_message */
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -37,6 +39,7 @@
 #define LINE_BUF_SIZE 4096
 #define STORAGE_PATH  "./agentfiles/IT24103002/"
 #define MAX_FILE_SIZE (10 * 1024 * 1024)   /* 10 MB cap */
+#define MONITOR_INTERVAL_SEC 2
 
 /* ============================================================
    Thread-safe logging
@@ -84,25 +87,22 @@ static int send_line(int fd, const char *body) {
 }
 
 /* ============================================================
-   SYSINFO: CPU load, memory used, uptime from /proc.
+   Gather system stats - used by SYSINFO and the UDP monitor.
    ============================================================ */
-static void handle_sysinfo(int fd) {
-    double cpu_load    = 0.0;
-    long   mem_used_mb = 0;
-    double uptime_sec  = 0.0;
+static void read_sys_stats(double *cpu_load,
+                           long *mem_used_mb,
+                           double *uptime_sec) {
+    *cpu_load    = 0.0;
+    *mem_used_mb = 0;
+    *uptime_sec  = 0.0;
 
     FILE *fp = fopen("/proc/loadavg", "r");
-    if (fp) {
-        fscanf(fp, "%lf", &cpu_load);
-        fclose(fp);
-    }
+    if (fp) { fscanf(fp, "%lf", cpu_load); fclose(fp); }
 
     long mem_total_kb = 0, mem_avail_kb = 0;
     fp = fopen("/proc/meminfo", "r");
     if (fp) {
-        char key[64];
-        long value;
-        char unit[16];
+        char key[64]; long value; char unit[16];
         while (fscanf(fp, "%63s %ld %15s", key, &value, unit) == 3) {
             if (strcmp(key, "MemTotal:") == 0)      mem_total_kb = value;
             if (strcmp(key, "MemAvailable:") == 0)  mem_avail_kb = value;
@@ -111,13 +111,18 @@ static void handle_sysinfo(int fd) {
         fclose(fp);
     }
     if (mem_total_kb > mem_avail_kb)
-        mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024;
+        *mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024;
 
     fp = fopen("/proc/uptime", "r");
-    if (fp) {
-        fscanf(fp, "%lf", &uptime_sec);
-        fclose(fp);
-    }
+    if (fp) { fscanf(fp, "%lf", uptime_sec); fclose(fp); }
+}
+
+/* ============================================================
+   SYSINFO: CPU load, memory used, uptime from /proc.
+   ============================================================ */
+static void handle_sysinfo(int fd) {
+    double cpu_load; long mem_used_mb; double uptime_sec;
+    read_sys_stats(&cpu_load, &mem_used_mb, &uptime_sec);
 
     char body[256];
     snprintf(body, sizeof(body),
@@ -283,8 +288,6 @@ static void handle_put(int fd, const char *filename,
 
 /* ============================================================
    GET <filename>: send a file previously stored via PUT.
-   Response: "OK FILE_SEND <name> <size> SID:2003\n"
-             followed by exactly <size> raw bytes.
    ============================================================ */
 static void handle_get(int fd, const char *filename, const char *ip) {
     if (!filename || *filename == '\0' ||
@@ -318,7 +321,6 @@ static void handle_get(int fd, const char *filename, const char *ip) {
     }
     rewind(fp);
 
-    /* Send the header line */
     char header[512];
     snprintf(header, sizeof(header),
              "OK FILE_SEND %s %ld", filename, filesize);
@@ -328,7 +330,6 @@ static void handle_get(int fd, const char *filename, const char *ip) {
         return;
     }
 
-    /* Send exactly filesize raw bytes - NO trailing newline */
     char buf[4096];
     long sent_total = 0;
     size_t n;
@@ -353,13 +354,127 @@ static void handle_get(int fd, const char *filename, const char *ip) {
 }
 
 /* ============================================================
+   Monitoring state (one per connected client).
+   ============================================================ */
+typedef struct {
+    pthread_t thread;
+    int       active;                    /* 1 = keep sending, 0 = stop */
+    int       running;                   /* 1 = thread exists */
+    char      client_ip[INET_ADDRSTRLEN];/* where to send datagrams   */
+    int       udp_port;                  /* controller's UDP port     */
+} monitor_state_t;
+
+/* ============================================================
+   Monitoring thread: sends a SYSINFO-like UDP datagram every
+   MONITOR_INTERVAL_SEC seconds until active=0.
+   ============================================================ */
+static void *monitor_thread(void *arg) {
+    monitor_state_t *m = (monitor_state_t *)arg;
+
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) {
+        log_message("UDP socket() failed: %s", strerror(errno));
+        return NULL;
+    }
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons((uint16_t)m->udp_port);
+    inet_pton(AF_INET, m->client_ip, &dest.sin_addr);
+
+    log_message("UDP monitor START -> %s:%d (interval %ds)",
+                m->client_ip, m->udp_port, MONITOR_INTERVAL_SEC);
+
+    while (m->active) {
+        double cpu_load; long mem_used_mb; double uptime_sec;
+        read_sys_stats(&cpu_load, &mem_used_mb, &uptime_sec);
+
+        char datagram[256];
+        snprintf(datagram, sizeof(datagram),
+                 "SYSINFO %.2f %ld %.0f SID:%s",
+                 cpu_load, mem_used_mb, uptime_sec, SID);
+
+        ssize_t s = sendto(udp_fd, datagram, strlen(datagram), 0,
+                           (struct sockaddr *)&dest, sizeof(dest));
+        if (s < 0) {
+            log_message("UDP sendto failed: %s", strerror(errno));
+        }
+
+        /* Sleep MONITOR_INTERVAL_SEC sec but in 100 ms chunks so
+           that STOP takes effect quickly. */
+        int chunks = MONITOR_INTERVAL_SEC * 10;
+        struct timespec ts = {0, 100 * 1000 * 1000};
+        for (int i = 0; i < chunks && m->active; i++) {
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    close(udp_fd);
+    log_message("UDP monitor STOP -> %s:%d", m->client_ip, m->udp_port);
+    return NULL;
+}
+
+/* ============================================================
    Per-client state passed to each thread.
    ============================================================ */
 typedef struct {
     int  client_fd;
     char client_ip[INET_ADDRSTRLEN];
     int  authed;
+    monitor_state_t monitor;
 } client_info_t;
+
+/* ============================================================
+   Monitoring helpers (must be above handle_client)
+   ============================================================ */
+static void monitor_start(client_info_t *info, int udp_port) {
+    if (udp_port <= 0 || udp_port > 65535) {
+        send_line(info->client_fd, "ERR 008 INVALID_PORT");
+        log_message("[%s] MONITOR START rejected: bad port %d",
+                    info->client_ip, udp_port);
+        return;
+    }
+
+    if (info->monitor.running) {
+        send_line(info->client_fd, "OK MONITOR_STARTED");
+        return;
+    }
+
+    memset(&info->monitor, 0, sizeof(info->monitor));
+    info->monitor.udp_port = udp_port;
+    strncpy(info->monitor.client_ip, info->client_ip,
+            INET_ADDRSTRLEN - 1);
+    info->monitor.client_ip[INET_ADDRSTRLEN - 1] = '\0';
+    info->monitor.active  = 1;
+    info->monitor.running = 1;
+
+    if (pthread_create(&info->monitor.thread, NULL,
+                       monitor_thread, &info->monitor) != 0) {
+        info->monitor.running = 0;
+        info->monitor.active  = 0;
+        send_line(info->client_fd, "ERR 003 INTERNAL_ERROR");
+        log_message("[%s] MONITOR START pthread_create failed",
+                    info->client_ip);
+        return;
+    }
+
+    send_line(info->client_fd, "OK MONITOR_STARTED");
+    log_message("[%s] MONITOR_STARTED (udp_port=%d)",
+                info->client_ip, udp_port);
+}
+
+static void monitor_stop(client_info_t *info, int send_ok) {
+    if (info->monitor.running) {
+        info->monitor.active = 0;
+        pthread_join(info->monitor.thread, NULL);
+        info->monitor.running = 0;
+        log_message("[%s] MONITOR_STOPPED", info->client_ip);
+    }
+    if (send_ok) {
+        send_line(info->client_fd, "OK MONITOR_STOPPED");
+    }
+}
 
 /* ============================================================
    Thread function: handles one client for its lifetime.
@@ -448,13 +563,27 @@ static void *handle_client(void *arg) {
                             long filesize = atol(arg2);
                             handle_put(fd, arg1, filesize, ip);
                         }
-                        /* PUT consumed raw bytes directly from the
-                           socket; skip the rest of this recv buffer. */
                         line_len = 0;
                         i = n;
                         continue;
                     }
+                    else if (strcasecmp(cmd, "MONITOR") == 0) {
+                        if (strcasecmp(arg1, "START") == 0 &&
+                            matched >= 3) {
+                            int udp_port = atoi(arg2);
+                            monitor_start(info, udp_port);
+                        }
+                        else if (strcasecmp(arg1, "STOP") == 0) {
+                            monitor_stop(info, 1);
+                        }
+                        else {
+                            send_line(fd, "ERR 999 NOT_IMPLEMENTED");
+                            log_message("[%s] MONITOR invalid subcmd",
+                                        ip);
+                        }
+                    }
                     else if (strcasecmp(cmd, "QUIT") == 0) {
+                        monitor_stop(info, 0);   /* silent */
                         send_line(fd, "OK BYE");
                         log_message("[%s] QUIT", ip);
                         goto cleanup;
@@ -479,6 +608,8 @@ static void *handle_client(void *arg) {
     }
 
 cleanup:
+    monitor_stop(info, 0);   /* safe - no-op if not running */
+
     log_message("Client disconnected: %s (fd=%d)", ip, fd);
     printf("Client disconnected: %s (fd=%d)\n", ip, fd);
     fflush(stdout);
@@ -550,6 +681,7 @@ int main(void) {
             continue;
         }
 
+        memset(info, 0, sizeof(*info));   /* zero monitor state too */
         info->client_fd = client_fd;
         info->authed    = 0;
 

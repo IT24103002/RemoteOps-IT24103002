@@ -125,3 +125,27 @@
 - Next: UDP monitoring with MONITOR START/STOP.
 
 
+## 2026-10-06 - Session 8: UDP monitoring
+- Added `monitor_state_t` struct stored inside `client_info_t`.
+- Added `monitor_thread()` - spawns a per-session thread that:
+  - Creates a UDP socket (ephemeral source port).
+  - Sends "SYSINFO <cpu> <mem> <uptime> SID:2003" every 2 seconds to
+    (client_ip, udp_port).
+  - Uses a shared `active` flag for cooperative shutdown.
+  - Sleeps in 100ms chunks so STOP is responsive within ~100ms.
+- Added `monitor_start()` and `monitor_stop(send_ok)` helpers.
+- Wired MONITOR START/STOP into the dispatcher.
+- QUIT and disconnect both call `monitor_stop(info, 0)` - silent
+  cleanup. `pthread_join` ensures the monitor thread exits before
+  the client socket is closed and the info struct is freed.
+- Rejected pthread_cancel - safe cooperative shutdown with a flag
+  is the correct pattern.
+- Tested:
+  - Python UDP receiver on 127.0.0.1:5555 receives 3 datagrams in 6s.
+  - MONITOR STOP stops them cleanly.
+  - MONITOR START 0 / 70000 / abc -> ERR 008 INVALID_PORT.
+  - Ctrl+C on the TCP client mid-monitoring -> monitor thread joins,
+    no crash, log shows auto-stopped.
+- Next: thread-safe logging polish, graceful disconnect handling.
+
+
