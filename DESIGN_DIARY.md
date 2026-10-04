@@ -170,3 +170,33 @@
   - Ctrl+C on agent -> logged "shutting down", clean exit.
 - Next: build the real controller.
 
+## 2026-10-06 - Session 10: Real Controller
+- Wrote controller_002.c: an interactive C client for the protocol.
+- Replaces nc and Python for real use.
+- Features:
+  - Auto-connects to 127.0.0.1:9410 and authenticates with token OPS-3002.
+  - Interactive prompt "RemoteOps> ".
+  - Parses local commands: sysinfo, listproc, exec, put, get,
+    monitor start/stop, help, quit.
+  - tcp_send_line(): adds '\n', sends fully (loop over send).
+  - tcp_recv_line(): byte-by-byte until '\n', strips '\r'.
+  - tcp_recv_exact(): for binary PUT/GET body.
+  - PUT: reads local file, sends header, small 50 ms sleep so header
+    and body arrive in separate segments (documented limitation),
+    then streams the raw bytes.
+  - GET: sends request, parses "OK FILE_SEND <name> <size>",
+    reads exactly <size> bytes, writes to local file.
+  - MONITOR START: sends command, then spawns a UDP receiver thread
+    bound to the requested port. Datagrams printed live.
+  - MONITOR STOP: sends command, signals UDP thread to exit,
+    pthread_joins it.
+- Tested:
+  - sysinfo/listproc/exec return real data.
+  - exec rm -rf / rejected correctly.
+  - put /tmp/test.txt then get -> BYTE-IDENTICAL.
+  - monitor start 5555 -> datagrams arrive every 2 s -> monitor stop
+    -> clean exit.
+  - Bogus commands -> unknown command message.
+- Next: review all code, take screenshots, write Implementation Report.
+
+
