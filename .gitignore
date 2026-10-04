@@ -1,0 +1,19 @@
+# Compiled binaries
+agent_002
+controller_002
+*.o
+
+# ZIP archives
+*.zip
+
+# Uploaded files (keep folder, ignore contents)
+agentfiles/IT24103002/*
+!agentfiles/IT24103002/.gitkeep
+
+#editor temp files
+*.swp
+*~
+
+# Log files (we'll commit a sample manually)
+*.log
+
