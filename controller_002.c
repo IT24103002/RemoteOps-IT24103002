@@ -3,15 +3,16 @@
    File: controller_002.c
    Connects to Agent on 127.0.0.1:9410
    Token: OPS-3002 | SID: 2003
+
    Interactive commands:
      sysinfo               - request system stats
      listproc              - request process list
-     exec <NAME>           - run whitelisted command (DATE, UPTIME,
-                             DISKFREE, HOSTNAME, WHOAMI)
+     exec <NAME>           - run whitelisted command
      put <local> [remote]  - upload file to agent
      get <remote> [local]  - download file from agent
      monitor start <port>  - begin UDP monitoring on <port>
      monitor stop          - stop UDP monitoring
+     help                  - show command list
      quit                  - disconnect and exit
    ============================================================ */
 
@@ -23,12 +24,13 @@
 #include <strings.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <sys/time.h>
-#include <time.h>
+#include <sys/time.h>   /* struct timeval */
+#include <time.h>       /* nanosleep */
 
 /* ---------- Personalised constants ---------- */
 #define SERVER_IP     "127.0.0.1"
@@ -38,6 +40,14 @@
 #define LINE_BUF_SIZE 4096
 
 static int tcp_fd = -1;
+
+/* Ctrl+C flag - set by signal handler, checked by cleanup */
+static volatile int g_shutdown = 0;
+
+static void on_sigint(int sig) {
+    (void)sig;
+    g_shutdown = 1;
+}
 
 /* ============================================================
    Send a raw line (adds '\n'). No SID tag - client doesn't add it.
@@ -58,7 +68,6 @@ static int tcp_send_line(const char *line) {
 
 /* ============================================================
    Read a single line from the socket (until '\n').
-   Returns the number of bytes in `buf` (excluding NUL), or -1.
    ============================================================ */
 static int tcp_recv_line(char *buf, int maxlen) {
     int len = 0;
@@ -67,7 +76,7 @@ static int tcp_recv_line(char *buf, int maxlen) {
         ssize_t r = recv(tcp_fd, &c, 1, 0);
         if (r <= 0) return -1;
         if (c == '\n') { buf[len] = '\0'; return len; }
-        if (c == '\r') continue;             /* skip CR */
+        if (c == '\r') continue;
         buf[len++] = c;
     }
     buf[len] = '\0';
@@ -76,7 +85,6 @@ static int tcp_recv_line(char *buf, int maxlen) {
 
 /* ============================================================
    Read exactly n bytes from the socket.
-   Returns 0 on success, -1 on error.
    ============================================================ */
 static int tcp_recv_exact(char *buf, long n) {
     long got = 0;
@@ -89,10 +97,8 @@ static int tcp_recv_exact(char *buf, long n) {
 }
 
 /* ============================================================
-   Command handlers
+   Simple request/response commands.
    ============================================================ */
-
-/* Send a command, print the single-line response. */
 static void send_simple(const char *cmd) {
     if (tcp_send_line(cmd) != 0) {
         printf("!! Failed to send %s\n", cmd);
@@ -106,11 +112,14 @@ static void send_simple(const char *cmd) {
     printf("%s\n", resp);
 }
 
-/* PUT: upload a local file to the agent. */
+/* ============================================================
+   PUT: upload a local file.
+   ============================================================ */
 static void do_put(const char *local_path, const char *remote_name) {
     FILE *fp = fopen(local_path, "rb");
     if (!fp) {
-        printf("!! Cannot open local file: %s\n", local_path);
+        printf("!! Cannot open local file: %s (%s)\n",
+               local_path, strerror(errno));
         return;
     }
 
@@ -129,12 +138,11 @@ static void do_put(const char *local_path, const char *remote_name) {
         return;
     }
 
-    /* Small delay so the header and body arrive in separate TCP segments.
-       (Documented limitation: the agent assumes separate arrivals.) */
-    struct timespec ts = {0, 50 * 1000 * 1000};
+    /* Small delay so header and body arrive in separate TCP segments. */
+    struct timespec ts = {0, 50 * 1000 * 1000};   /* 50 ms */
     nanosleep(&ts, NULL);
 
-    /* Stream the file bytes */
+    /* Stream file bytes */
     char buf[4096];
     size_t n;
     long sent = 0;
@@ -162,7 +170,9 @@ static void do_put(const char *local_path, const char *remote_name) {
     printf("%s\n", resp);
 }
 
-/* GET: download a file from the agent. */
+/* ============================================================
+   GET: download a file.
+   ============================================================ */
 static void do_get(const char *remote_name, const char *local_path) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "GET %s", remote_name);
@@ -179,9 +189,8 @@ static void do_get(const char *remote_name, const char *local_path) {
     }
     printf("%s\n", header);
 
-    /* Parse: "OK FILE_SEND <name> <size> SID:2003" */
     if (strncmp(header, "OK FILE_SEND", 12) != 0) {
-        return;    /* error response - nothing more to read */
+        return;   /* error response - nothing more to read */
     }
 
     char name[256];
@@ -193,7 +202,8 @@ static void do_get(const char *remote_name, const char *local_path) {
 
     FILE *fp = fopen(local_path, "wb");
     if (!fp) {
-        printf("!! Cannot create local file: %s\n", local_path);
+        printf("!! Cannot create local file: %s (%s)\n",
+               local_path, strerror(errno));
         return;
     }
 
@@ -216,7 +226,7 @@ static void do_get(const char *remote_name, const char *local_path) {
 }
 
 /* ============================================================
-   UDP monitoring receiver (runs in its own thread)
+   UDP monitoring receiver thread.
    ============================================================ */
 static volatile int udp_active = 0;
 
@@ -226,7 +236,7 @@ static void *udp_receiver(void *arg) {
 
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) {
-        printf("!! UDP socket() failed\n");
+        printf("!! UDP socket() failed: %s\n", strerror(errno));
         return NULL;
     }
 
@@ -242,7 +252,9 @@ static void *udp_receiver(void *arg) {
         return NULL;
     }
 
-    printf("[UDP] Listening on port %d. Press Ctrl+C in that terminal or type 'monitor stop' to stop.\n", port);
+    printf("[UDP] Listening on port %d. Type 'monitor stop' to stop.\n",
+           port);
+    fflush(stdout);
 
     /* Timeout so we can notice udp_active = 0 */
     struct timeval tv = {0, 200000};   /* 200 ms */
@@ -259,7 +271,6 @@ static void *udp_receiver(void *arg) {
             printf("[UDP] %s\n", buf);
             fflush(stdout);
         }
-        /* r == -1 with EAGAIN/EWOULDBLOCK is fine (timeout) */
     }
 
     close(udp_fd);
@@ -297,7 +308,7 @@ static void monitor_start(const char *port_str) {
     printf("%s\n", resp);
 
     if (strncmp(resp, "OK MONITOR_STARTED", 18) != 0) {
-        return;    /* rejected - don't start UDP receiver */
+        return;
     }
 
     udp_active = 1;
@@ -312,19 +323,19 @@ static void monitor_start(const char *port_str) {
     udp_thread_running = 1;
 }
 
-static void monitor_stop(void) {
-    if (!udp_thread_running) {
-        printf("!! Monitoring not running.\n");
-        return;
-    }
+/* Stop UDP monitoring. If send_cmd = 1, sends MONITOR STOP over TCP. */
+static void monitor_stop_internal(int send_cmd) {
+    if (!udp_thread_running) return;
 
-    if (tcp_send_line("MONITOR STOP") != 0) {
-        printf("!! Failed to send MONITOR STOP\n");
-        return;
-    }
-    char resp[LINE_BUF_SIZE];
-    if (tcp_recv_line(resp, sizeof(resp)) >= 0) {
-        printf("%s\n", resp);
+    if (send_cmd) {
+        if (tcp_send_line("MONITOR STOP") != 0) {
+            printf("!! Failed to send MONITOR STOP\n");
+        } else {
+            char resp[LINE_BUF_SIZE];
+            if (tcp_recv_line(resp, sizeof(resp)) >= 0) {
+                printf("%s\n", resp);
+            }
+        }
     }
 
     udp_active = 0;
@@ -333,7 +344,7 @@ static void monitor_stop(void) {
 }
 
 /* ============================================================
-   Interactive command parser
+   Help text.
    ============================================================ */
 static void print_help(void) {
     printf("Commands:\n");
@@ -353,7 +364,13 @@ static const char *basename_of(const char *path) {
     return slash ? slash + 1 : path;
 }
 
+/* ============================================================
+   main()
+   ============================================================ */
 int main(void) {
+    /* Install Ctrl+C handler */
+    signal(SIGINT, on_sigint);
+
     /* 1. Connect */
     tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_fd < 0) {
@@ -368,35 +385,37 @@ int main(void) {
 
     if (connect(tcp_fd, (struct sockaddr *)&server,
                 sizeof(server)) < 0) {
-        perror("connect");
-        fprintf(stderr,
-                "Is the agent running on %s:%d?\n",
-                SERVER_IP, SERVER_PORT);
+        fprintf(stderr, "!! Cannot connect to agent at %s:%d - %s\n",
+                SERVER_IP, SERVER_PORT, strerror(errno));
+        fprintf(stderr, "   Is ./agent_002 running?\n");
         close(tcp_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Connected to RemoteOps Agent at %s:%d\n", SERVER_IP, SERVER_PORT);
+    printf("Connected to RemoteOps Agent at %s:%d\n",
+           SERVER_IP, SERVER_PORT);
 
     /* 2. Authenticate */
     char auth_cmd[128];
     snprintf(auth_cmd, sizeof(auth_cmd), "AUTH %s", AUTH_TOKEN);
     if (tcp_send_line(auth_cmd) != 0) {
-        fprintf(stderr, "Failed to send AUTH\n");
+        fprintf(stderr, "!! Failed to send AUTH\n");
         close(tcp_fd);
         exit(EXIT_FAILURE);
     }
 
     char resp[LINE_BUF_SIZE];
     if (tcp_recv_line(resp, sizeof(resp)) < 0) {
-        fprintf(stderr, "No response to AUTH\n");
+        fprintf(stderr, "!! No response to AUTH\n");
         close(tcp_fd);
         exit(EXIT_FAILURE);
     }
     printf("%s\n", resp);
 
     if (strncmp(resp, "OK AUTHENTICATED", 16) != 0) {
-        fprintf(stderr, "Authentication failed. Exiting.\n");
+        fprintf(stderr, "!! Authentication failed (agent said: %s)\n",
+                resp);
+        fprintf(stderr, "   Expected token: %s\n", AUTH_TOKEN);
         close(tcp_fd);
         exit(EXIT_FAILURE);
     }
@@ -405,20 +424,19 @@ int main(void) {
 
     /* 3. Interactive loop */
     char input[LINE_BUF_SIZE];
-    while (1) {
+    while (!g_shutdown) {
         printf("RemoteOps> ");
         fflush(stdout);
 
         if (!fgets(input, sizeof(input), stdin)) {
+            /* EOF (Ctrl+D) or Ctrl+C interrupting the read */
             printf("\n");
-            break;      /* Ctrl+D */
+            break;
         }
         input[strcspn(input, "\n")] = '\0';
 
-        /* Skip empty input */
         if (input[0] == '\0') continue;
 
-        /* Tokenize: cmd + up to 2 args */
         char cmd[64] = {0}, a1[256] = {0}, a2[256] = {0};
         int n = sscanf(input, "%63s %255s %255s", cmd, a1, a2);
 
@@ -426,10 +444,6 @@ int main(void) {
 
         if (strcasecmp(cmd, "quit") == 0 ||
             strcasecmp(cmd, "exit") == 0) {
-            tcp_send_line("QUIT");
-            if (tcp_recv_line(resp, sizeof(resp)) >= 0) {
-                printf("%s\n", resp);
-            }
             break;
         }
         else if (strcasecmp(cmd, "help") == 0) {
@@ -458,12 +472,15 @@ int main(void) {
             do_get(a1, local);
         }
         else if (strcasecmp(cmd, "monitor") == 0) {
-            if (n < 2) { printf("Usage: monitor start <port> | monitor stop\n"); continue; }
+            if (n < 2) {
+                printf("Usage: monitor start <port> | monitor stop\n");
+                continue;
+            }
             if (strcasecmp(a1, "start") == 0 && n >= 3) {
                 monitor_start(a2);
             }
             else if (strcasecmp(a1, "stop") == 0) {
-                monitor_stop();
+                monitor_stop_internal(1);
             }
             else {
                 printf("Usage: monitor start <port> | monitor stop\n");
@@ -474,10 +491,19 @@ int main(void) {
         }
     }
 
-    /* 4. Clean up */
+    /* 4. Clean shutdown */
+    if (g_shutdown) {
+        printf("\nCtrl+C received - cleaning up...\n");
+    }
+
     if (udp_thread_running) {
-        udp_active = 0;
-        pthread_join(udp_thread, NULL);
+        monitor_stop_internal(1);   /* send MONITOR STOP + join */
+    }
+
+    tcp_send_line("QUIT");
+    char final_resp[LINE_BUF_SIZE];
+    if (tcp_recv_line(final_resp, sizeof(final_resp)) >= 0) {
+        printf("%s\n", final_resp);
     }
 
     close(tcp_fd);

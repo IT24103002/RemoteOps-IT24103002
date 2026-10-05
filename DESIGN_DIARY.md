@@ -199,4 +199,24 @@
   - Bogus commands -> unknown command message.
 - Next: review all code, take screenshots, write Implementation Report.
 
+## 2026-10-06 - Session 11: Controller polish + E2E testing
+- Added SIGINT handling to controller: Ctrl+C triggers clean
+  shutdown (stop monitoring, send QUIT, close socket).
+- Improved connect/auth failure messages (include errno and hint).
+- Wrote test_all.sh: scripted controller session exercising all
+  commands and verifying downloaded file byte-identity.
+- Created TEST_RESULTS.md: 20-case test matrix covering AUTH,
+  auth gate, all commands, file transfers, path traversal,
+  monitoring, and disconnect handling.
+- Screenshots captured:
+  - Agent startup + listening on 9410 (ss -tlnp)
+  - Full controller session with SYSINFO, LISTPROC, EXEC
+  - EXEC rejection cases
+  - PUT + GET with byte-identical verification
+  - MONITOR START datagrams + MONITOR STOP
+  - Ctrl+C clean shutdown
+  - nc AUTH_FAILED test
+  - Agent log tail showing all commands
+- Next: review code for issues, then write the Implementation Report.
+
 
